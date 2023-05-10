@@ -11,6 +11,7 @@ import torch.nn as nn
 from torch.utils.data import DataLoader, Dataset
 from torchvision import transforms
 from sklearn.metrics import roc_auc_score
+from tqdm import tqdm
 
 from models.scse import SCSEUnet
 
@@ -115,13 +116,12 @@ def forensics_test(
 ):
     test_size = '896'
     decompose(input_dir, test_size, temp_dir)
-    print('Decomposition complete.')
     test_dataset = MyDataset(test_path=str(temp_dir/f"input_decompose_{test_size}")+"/",
                              size=int(test_size))
     path_out: str = str(temp_dir/f"input_decompose_{test_size}_pred") + "/"
     test_loader = DataLoader(dataset=test_dataset, batch_size=1, shuffle=False, num_workers=1)
     rm_and_make_dir(path_out)
-    for items in test_loader:
+    for items in tqdm(test_loader, desc="Computing IFOSN model outputs", unit="image"):
         Ii, Mg = (item.cuda() for item in items[:-1])
         filename = items[-1]
         Mo = model(Ii)
@@ -130,11 +130,9 @@ def forensics_test(
         for i in range(len(Mo)):
             Mo_tmp = Mo[i][..., ::-1]
             cv2.imwrite(path_out + filename[i][:-4] + '.png', Mo_tmp)
-    print('Prediction complete.')
     if os.path.exists(str(temp_dir) + '/input_decompose_' + test_size + '/'):
         shutil.rmtree(str(temp_dir) + '/input_decompose_' + test_size + '/')
     path_pre = merge(input_dir, test_size, output_dir, temp_dir)
-    print('Merging complete.')
 
     path_gt = 'data/mask/'
     if os.path.exists(path_gt):
@@ -168,7 +166,7 @@ def decompose(test_path: pathlib.Path, test_size, temp_dir: pathlib.Path):
         path_out = str(temp_dir) + '/input_decompose_' + str(size) + '/'
         rm_and_make_dir(path_out)
     rtn_list = [[]]
-    for file in flist:
+    for file in tqdm(flist, desc="Decomposing input images", unit="image"):
         img = cv2.imread(test_path + file)
         # img = cv2.rotate(img, cv2.cv2.ROTATE_180)
         H, W, _ = img.shape
@@ -221,7 +219,7 @@ def merge(
     gk = gkern(size)
     gk = 1 - gk
 
-    for file in sorted(os.listdir(path)):
+    for file in tqdm(sorted(os.listdir(path)), desc="Merging output images", unit="image"):
         img = cv2.imread(path + file)
         H, W, _ = img.shape
         X, Y = H // (size // 2) + 1, W // (size // 2) + 1
