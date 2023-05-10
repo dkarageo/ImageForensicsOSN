@@ -1,0 +1,9 @@
+# -- Packages that should be installed through anaconda. --
+# torch~=1.13.1
+# torchvision~=0.14.1
+# -- Packages that should be installed through pip. --
+cog~=0.6.1
+numpy~=1.24.3
+Pillow~=9.5.0
+scikit_learn~=1.2.2
+opencv-python
