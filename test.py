@@ -78,10 +78,22 @@ class Model(nn.Module):
 
 
 @click.command()
+@click.option("--input_dir",
+              type=click.Path(file_okay=False, path_type=pathlib.Path),
+              default=pathlib.Path("./data/input"),
+              help="Directory that contains the images to be analyzed.")
+@click.option("--output_dir",
+              type=click.Path(file_okay=False, path_type=pathlib.Path),
+              default=pathlib.Path("./data/output"),
+              help="Directory where the results will be exported.")
 @click.option("--temp_dir",
               type=click.Path(file_okay=False, path_type=pathlib.Path),
               default=pathlib.Path("./temp"))
-def cli(temp_dir: pathlib.Path) -> None:
+def cli(
+    input_dir: pathlib.Path,
+    output_dir: pathlib.Path,
+    temp_dir: pathlib.Path,
+) -> None:
     # Load model.
     model = Model().cuda()
     model.load()
@@ -89,13 +101,20 @@ def cli(temp_dir: pathlib.Path) -> None:
 
     temp_dir.mkdir(exist_ok=True, parents=True)
 
-    forensics_test(model=model, temp_dir=temp_dir)
+    forensics_test(model=model,
+                   input_dir=input_dir,
+                   output_dir=output_dir,
+                   temp_dir=temp_dir)
 
 
-def forensics_test(model, temp_dir: pathlib.Path):
+def forensics_test(
+    model,
+    input_dir: pathlib.Path,
+    output_dir: pathlib.Path,
+    temp_dir: pathlib.Path
+):
     test_size = '896'
-    test_path = 'data/input/'
-    decompose(test_path, test_size, temp_dir)
+    decompose(input_dir, test_size, temp_dir)
     print('Decomposition complete.')
     test_dataset = MyDataset(test_path=str(temp_dir/f"input_decompose_{test_size}")+"/",
                              size=int(test_size))
@@ -114,7 +133,7 @@ def forensics_test(model, temp_dir: pathlib.Path):
     print('Prediction complete.')
     if os.path.exists(str(temp_dir) + '/input_decompose_' + test_size + '/'):
         shutil.rmtree(str(temp_dir) + '/input_decompose_' + test_size + '/')
-    path_pre = merge(test_path, test_size, temp_dir)
+    path_pre = merge(input_dir, test_size, output_dir, temp_dir)
     print('Merging complete.')
 
     path_gt = 'data/mask/'
@@ -141,7 +160,8 @@ def forensics_test(model, temp_dir: pathlib.Path):
     return 0
 
 
-def decompose(test_path, test_size, temp_dir: pathlib.Path):
+def decompose(test_path: pathlib.Path, test_size, temp_dir: pathlib.Path):
+    test_path: str = str(test_path) + "/"  # Quick fix on old code fore working with pathlib paths.
     flist = sorted(os.listdir(test_path))
     size_list = [int(test_size)]
     for size in size_list:
@@ -186,9 +206,15 @@ def decompose(test_path, test_size, temp_dir: pathlib.Path):
     return rtn_list
 
 
-def merge(path, test_size, temp_dir: pathlib.Path):
+def merge(
+    path: pathlib.Path,
+    test_size: str,
+    output_dir: pathlib.Path,
+    temp_dir: pathlib.Path
+):
+    path: str = str(path) + "/"  # Quick fix on old code for working with pathlib paths.
     path_d = str(temp_dir) + '/input_decompose_' + test_size + '_pred/'
-    path_r = 'data/output/'
+    path_r = str(output_dir) + "/"
     rm_and_make_dir(path_r)
     size = int(test_size)
 
