@@ -1,14 +1,19 @@
 import os
-import cv2
 import copy
+import pathlib
 import shutil
+
 import numpy as np
+import cv2
+import click
 import torch
 import torch.nn as nn
 from torch.utils.data import DataLoader, Dataset
 from torchvision import transforms
 from sklearn.metrics import roc_auc_score
+
 from models.scse import SCSEUnet
+
 
 gpu_ids = '0, 1'
 os.environ['CUDA_VISIBLE_DEVICES'] = gpu_ids
@@ -72,13 +77,29 @@ class Model(nn.Module):
         self.gen.load_state_dict(torch.load(self.save_dir + path + '%s_weights.pth' % self.networks.name))
 
 
-def forensics_test(model):
+@click.command()
+@click.option("--temp_dir",
+              type=click.Path(file_okay=False, path_type=pathlib.Path),
+              default=pathlib.Path("./temp"))
+def cli(temp_dir: pathlib.Path) -> None:
+    # Load model.
+    model = Model().cuda()
+    model.load()
+    model.eval()
+
+    temp_dir.mkdir(exist_ok=True, parents=True)
+
+    forensics_test(model=model, temp_dir=temp_dir)
+
+
+def forensics_test(model, temp_dir: pathlib.Path):
     test_size = '896'
     test_path = 'data/input/'
-    decompose(test_path, test_size)
+    decompose(test_path, test_size, temp_dir)
     print('Decomposition complete.')
-    test_dataset = MyDataset(test_path='temp/input_decompose_' + test_size + '/', size=int(test_size))
-    path_out = 'temp/input_decompose_' + test_size + '_pred/'
+    test_dataset = MyDataset(test_path=str(temp_dir/f"input_decompose_{test_size}")+"/",
+                             size=int(test_size))
+    path_out: str = str(temp_dir/f"input_decompose_{test_size}_pred") + "/"
     test_loader = DataLoader(dataset=test_dataset, batch_size=1, shuffle=False, num_workers=1)
     rm_and_make_dir(path_out)
     for items in test_loader:
@@ -91,9 +112,9 @@ def forensics_test(model):
             Mo_tmp = Mo[i][..., ::-1]
             cv2.imwrite(path_out + filename[i][:-4] + '.png', Mo_tmp)
     print('Prediction complete.')
-    if os.path.exists('temp/input_decompose_' + test_size + '/'):
-        shutil.rmtree('temp/input_decompose_' + test_size + '/')
-    path_pre = merge(test_path, test_size)
+    if os.path.exists(str(temp_dir) + '/input_decompose_' + test_size + '/'):
+        shutil.rmtree(str(temp_dir) + '/input_decompose_' + test_size + '/')
+    path_pre = merge(test_path, test_size, temp_dir)
     print('Merging complete.')
 
     path_gt = 'data/mask/'
@@ -120,11 +141,11 @@ def forensics_test(model):
     return 0
 
 
-def decompose(test_path, test_size):
+def decompose(test_path, test_size, temp_dir: pathlib.Path):
     flist = sorted(os.listdir(test_path))
     size_list = [int(test_size)]
     for size in size_list:
-        path_out = 'temp/input_decompose_' + str(size) + '/'
+        path_out = str(temp_dir) + '/input_decompose_' + str(size) + '/'
         rm_and_make_dir(path_out)
     rtn_list = [[]]
     for file in flist:
@@ -138,7 +159,7 @@ def decompose(test_path, test_size):
             size_idx += 1
         rtn_list[size_idx].append(file)
         size = size_list[size_idx]
-        path_out = 'temp/input_decompose_' + str(size) + '/'
+        path_out = str(temp_dir) + '/input_decompose_' + str(size) + '/'
         X, Y = H // (size // 2) + 1, W // (size // 2) + 1
         idx = 0
         for x in range(X-1):
@@ -165,8 +186,8 @@ def decompose(test_path, test_size):
     return rtn_list
 
 
-def merge(path, test_size):
-    path_d = 'temp/input_decompose_' + test_size + '_pred/'
+def merge(path, test_size, temp_dir: pathlib.Path):
+    path_d = str(temp_dir) + '/input_decompose_' + test_size + '_pred/'
     path_r = 'data/output/'
     rm_and_make_dir(path_r)
     size = int(test_size)
@@ -273,7 +294,4 @@ def metric(premask, groundtruth):
 
 
 if __name__ == '__main__':
-    model = Model().cuda()
-    model.load()
-    model.eval()
-    forensics_test(model=model)
+    cli()
