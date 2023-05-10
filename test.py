@@ -16,10 +16,6 @@ from tqdm import tqdm
 from models.scse import SCSEUnet
 
 
-gpu_ids = '0, 1'
-os.environ['CUDA_VISIBLE_DEVICES'] = gpu_ids
-
-
 class MyDataset(Dataset):
     def __init__(self, test_path='', size=896):
         self.test_path = test_path
@@ -65,11 +61,11 @@ class Detector(nn.Module):
 
 
 class Model(nn.Module):
-    def __init__(self):
+    def __init__(self, device: str = "cuda"):
         super(Model, self).__init__()
         self.save_dir = 'weights/'
         self.networks = Detector()
-        self.gen = nn.DataParallel(self.networks).cuda()
+        self.gen = nn.DataParallel(self.networks, device_ids=[device])
 
     def forward(self, Ii):
         return self.gen(Ii)
@@ -90,29 +86,34 @@ class Model(nn.Module):
 @click.option("--temp_dir",
               type=click.Path(file_okay=False, path_type=pathlib.Path),
               default=pathlib.Path("./temp"))
+@click.option("--device", type=str, default="cuda")
 def cli(
     input_dir: pathlib.Path,
     output_dir: pathlib.Path,
     temp_dir: pathlib.Path,
+    device: str
 ) -> None:
     # Load model.
-    model = Model().cuda()
+    model = Model(device=device)
     model.load()
     model.eval()
+    model.to(device)
 
     temp_dir.mkdir(exist_ok=True, parents=True)
 
     forensics_test(model=model,
                    input_dir=input_dir,
                    output_dir=output_dir,
-                   temp_dir=temp_dir)
+                   temp_dir=temp_dir,
+                   device=device)
 
 
 def forensics_test(
     model,
     input_dir: pathlib.Path,
     output_dir: pathlib.Path,
-    temp_dir: pathlib.Path
+    temp_dir: pathlib.Path,
+    device: str
 ):
     test_size = '896'
     decompose(input_dir, test_size, temp_dir)
@@ -122,7 +123,7 @@ def forensics_test(
     test_loader = DataLoader(dataset=test_dataset, batch_size=1, shuffle=False, num_workers=1)
     rm_and_make_dir(path_out)
     for items in tqdm(test_loader, desc="Computing IFOSN model outputs", unit="image"):
-        Ii, Mg = (item.cuda() for item in items[:-1])
+        Ii, Mg = (item.to(device) for item in items[:-1])
         filename = items[-1]
         Mo = model(Ii)
         Mo = Mo * 255.
