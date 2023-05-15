@@ -2,6 +2,7 @@ import os
 import copy
 import pathlib
 import shutil
+from typing import Any, Generator, Optional
 
 import numpy as np
 import cv2
@@ -71,10 +72,12 @@ class Model(nn.Module):
         return self.gen(Ii)
 
     def load(self, path=''):
-        self.gen.load_state_dict(torch.load(self.save_dir + path + '%s_weights.pth' % self.networks.name))
+        self.gen.load_state_dict(
+            torch.load(self.save_dir + path + '%s_weights.pth' % self.networks.name)
+        )
 
 
-@click.command()
+@click.command(help="Performs a forensics analysis of images using IFOSN.")
 @click.option("--input_dir",
               type=click.Path(file_okay=False, path_type=pathlib.Path),
               default=pathlib.Path("./data/input"),
@@ -87,11 +90,18 @@ class Model(nn.Module):
               type=click.Path(file_okay=False, path_type=pathlib.Path),
               default=pathlib.Path("./temp"))
 @click.option("--device", type=str, default="cuda")
+@click.option("--chunk_size", type=int,
+              help="When chunk size is provided the computation is performed in "
+                   "multiple iterations, each processing at most the given number of images. "
+                   "The use of this parameter allows to reduce the amount of disk required for "
+                   "storing the intermediate files that are generated during the "
+                   "IFOSN computation.")
 def cli(
     input_dir: pathlib.Path,
     output_dir: pathlib.Path,
     temp_dir: pathlib.Path,
-    device: str
+    device: str,
+    chunk_size: Optional[int]
 ) -> None:
     # Load model.
     model = Model(device=device)
@@ -101,27 +111,53 @@ def cli(
 
     temp_dir.mkdir(exist_ok=True, parents=True)
 
-    forensics_test(model=model,
-                   input_dir=input_dir,
-                   output_dir=output_dir,
-                   temp_dir=temp_dir,
-                   device=device)
+    process_images_in_dir(
+        model=model,
+        input_dir=input_dir,
+        output_dir=output_dir,
+        temp_dir=temp_dir,
+        device=device,
+        chunk_size=chunk_size
+    )
 
 
-def forensics_test(
+def process_images_in_dir(
     model,
     input_dir: pathlib.Path,
     output_dir: pathlib.Path,
     temp_dir: pathlib.Path,
+    device: str,
+    chunk_size: Optional[int] = None
+) -> None:
+    images: list[pathlib.Path] = sorted(list(input_dir.iterdir()))
+    if chunk_size is None:
+        images_batches: list[list[pathlib.Path]] = [images]
+    else:
+        images_batches: list[list[pathlib.Path]] = list(split_in_chunks(images, chunk_size))
+
+    for batch in images_batches:
+        forensics_test(model, batch, output_dir, temp_dir, device)
+
+
+def forensics_test(
+    model,
+    images: list[pathlib.Path],
+    output_dir: pathlib.Path,
+    temp_dir: pathlib.Path,
     device: str
 ):
-    test_size = '896'
-    decompose(input_dir, test_size, temp_dir)
-    test_dataset = MyDataset(test_path=str(temp_dir/f"input_decompose_{test_size}")+"/",
+    test_size: int = 896
+
+    # Decompose input images.
+    decomposition_dir: pathlib.Path = temp_dir / f"input_decompose_{test_size}"
+    decompose(images, test_size, decomposition_dir)
+
+    # Compute forgery localization masks of the decomposed images.
+    test_dataset = MyDataset(test_path=str(decomposition_dir)+"/",
                              size=int(test_size))
-    path_out: str = str(temp_dir/f"input_decompose_{test_size}_pred") + "/"
+    predictions_dir: pathlib.Path = temp_dir / f"input_decompose_{test_size}_pred"
     test_loader = DataLoader(dataset=test_dataset, batch_size=1, shuffle=False, num_workers=1)
-    rm_and_make_dir(path_out)
+    predictions_dir.mkdir(parents=True, exist_ok=True)
     for items in tqdm(test_loader, desc="Computing IFOSN model outputs", unit="image"):
         Ii, Mg = (item.to(device) for item in items[:-1])
         filename = items[-1]
@@ -130,11 +166,20 @@ def forensics_test(
         Mo = Mo.permute(0, 2, 3, 1).cpu().detach().numpy()
         for i in range(len(Mo)):
             Mo_tmp = Mo[i][..., ::-1]
-            cv2.imwrite(path_out + filename[i][:-4] + '.png', Mo_tmp)
-    if os.path.exists(str(temp_dir) + '/input_decompose_' + test_size + '/'):
-        shutil.rmtree(str(temp_dir) + '/input_decompose_' + test_size + '/')
-    path_pre = merge(input_dir, test_size, output_dir, temp_dir)
+            cv2.imwrite(str(predictions_dir/f"{filename[i][:-4]}.png"), Mo_tmp)
 
+    # Clean-up decomposition directory.
+    if decomposition_dir.exists():
+        shutil.rmtree(decomposition_dir)
+
+    # Merge predictions of the decomposed images into the final predictions for each input image.
+    path_pre = merge(images, test_size, output_dir, temp_dir)
+
+    # Clean-up predictions directory of the decomposed images.
+    if predictions_dir.exists():
+        shutil.rmtree(predictions_dir)
+
+    # Perform evaluation.
     path_gt = 'data/mask/'
     if os.path.exists(path_gt):
         flist = sorted(os.listdir(path_pre))
@@ -149,79 +194,82 @@ def forensics_test(
                 gt[gt > 127] = 255
                 gt[gt <= 127] = 0
             if np.max(gt) != np.min(gt):
-                auc.append(roc_auc_score((gt.reshape(H * W * C) / 255).astype('int'), pre.reshape(H * W * C) / 255.))
+                auc.append(roc_auc_score(
+                    (gt.reshape(H * W * C) / 255).astype('int'), pre.reshape(H * W * C) / 255.)
+                )
             pre[pre > 127] = 255
             pre[pre <= 127] = 0
             a, b = metric(pre / 255, gt / 255)
             f1.append(a)
             iou.append(b)
-        print('Evaluation: AUC: %5.4f, F1: %5.4f, IOU: %5.4f' % (np.mean(auc), np.mean(f1), np.mean(iou)))
+        print('Evaluation: AUC: %5.4f, F1: %5.4f, IOU: %5.4f' % (np.mean(auc), np.mean(f1),
+                                                                 np.mean(iou)))
     return 0
 
 
-def decompose(test_path: pathlib.Path, test_size, temp_dir: pathlib.Path):
-    test_path: str = str(test_path) + "/"  # Quick fix on old code fore working with pathlib paths.
-    flist = sorted(os.listdir(test_path))
-    size_list = [int(test_size)]
-    for size in size_list:
-        path_out = str(temp_dir) + '/input_decompose_' + str(size) + '/'
-        rm_and_make_dir(path_out)
-    rtn_list = [[]]
-    for file in tqdm(flist, desc="Decomposing input images", unit="image"):
-        img = cv2.imread(test_path + file)
-        # img = cv2.rotate(img, cv2.cv2.ROTATE_180)
+def decompose(
+    images: list[pathlib.Path],
+    size: int,
+    out_path: pathlib.Path
+) -> None:
+    out_path.mkdir(exist_ok=True, parents=True)
+
+    for img_path in tqdm(images, desc="Decomposing input images", unit="image"):
+        # Load image.
+        img: np.ndarray = cv2.imread(str(img_path))
         H, W, _ = img.shape
-        size_idx = 0
-        while size_idx < len(size_list) - 1:
-            if H < size_list[size_idx+1] or W < size_list[size_idx+1]:
-                break
-            size_idx += 1
-        rtn_list[size_idx].append(file)
-        size = size_list[size_idx]
-        path_out = str(temp_dir) + '/input_decompose_' + str(size) + '/'
+
+        # Decompose image into smaller ones with dimensions at most (size, size).
         X, Y = H // (size // 2) + 1, W // (size // 2) + 1
-        idx = 0
+        idx: int = 0
         for x in range(X-1):
             if x * size // 2 + size > H:
                 break
             for y in range(Y-1):
                 if y * size // 2 + size > W:
                     break
-                img_tmp = img[x * size // 2: x * size // 2 + size, y * size // 2: y * size // 2 + size, :]
-                cv2.imwrite(path_out + file[:-4] + '_%03d.png' % idx, img_tmp)
+                decomposition_out_path: pathlib.Path = out_path / f"{img_path.stem}_{idx:03d}.png"
+                if not decomposition_out_path.exists():
+                    img_tmp = img[x * size // 2: x * size // 2 + size,
+                                  y * size // 2: y * size // 2 + size,
+                                  :]
+                    cv2.imwrite(str(decomposition_out_path), img_tmp)
                 idx += 1
-            img_tmp = img[x * size // 2: x * size // 2 + size, -size:, :]
-            cv2.imwrite(path_out + file[:-4] + '_%03d.png' % idx, img_tmp)
+            decomposition_out_path: pathlib.Path = out_path / f"{img_path.stem}_{idx:03d}.png"
+            if not decomposition_out_path.exists():
+                img_tmp = img[x * size // 2: x * size // 2 + size, -size:, :]
+                cv2.imwrite(str(decomposition_out_path), img_tmp)
             idx += 1
         for y in range(Y - 1):
             if y * size // 2 + size > W:
                 break
-            img_tmp = img[-size:, y * size // 2: y * size // 2 + size, :]
-            cv2.imwrite(path_out + file[:-4] + '_%03d.png' % idx, img_tmp)
+            decomposition_out_path: pathlib.Path = out_path / f"{img_path.stem}_{idx:03d}.png"
+            if not decomposition_out_path.exists():
+                img_tmp = img[-size:, y * size // 2: y * size // 2 + size, :]
+                cv2.imwrite(str(decomposition_out_path), img_tmp)
             idx += 1
-        img_tmp = img[-size:, -size:, :]
-        cv2.imwrite(path_out + file[:-4] + '_%03d.png' % idx, img_tmp)
+        decomposition_out_path: pathlib.Path = out_path / f"{img_path.stem}_{idx:03d}.png"
+        if not decomposition_out_path.exists():
+            img_tmp = img[-size:, -size:, :]
+            cv2.imwrite(str(decomposition_out_path), img_tmp)
         idx += 1
-    return rtn_list
 
 
 def merge(
-    path: pathlib.Path,
+    images: list[pathlib.Path],
     test_size: str,
     output_dir: pathlib.Path,
     temp_dir: pathlib.Path
-):
-    path: str = str(path) + "/"  # Quick fix on old code for working with pathlib paths.
-    path_d = str(temp_dir) + '/input_decompose_' + test_size + '_pred/'
-    path_r = str(output_dir) + "/"
-    rm_and_make_dir(path_r)
+) -> str:
+    output_dir.mkdir(exist_ok=True, parents=True)
+    path_d: pathlib.Path = temp_dir / f'input_decompose_{test_size}_pred'
     size = int(test_size)
 
     gk = gkern(size)
     gk = 1 - gk
 
-    for file in tqdm(sorted(os.listdir(path)), desc="Merging output images", unit="image"):
-        img = cv2.imread(path + file)
+    for img_path in tqdm(sorted(images), desc="Merging output images", unit="image"):
+        img = cv2.imread(str(img_path))
         H, W, _ = img.shape
         X, Y = H // (size // 2) + 1, W // (size // 2) + 1
         idx = 0
@@ -232,7 +280,7 @@ def merge(
             for y in range(Y-1):
                 if y * size // 2 + size > W:
                     break
-                img_tmp = cv2.imread(path_d + file[:-4] + '_%03d.png' % idx)
+                img_tmp = cv2.imread(str(path_d/f"{img_path.stem}_{idx:03d}.png"))
                 weight_cur = copy.deepcopy(rtn[x * size // 2: x * size // 2 + size, y * size // 2: y * size // 2 + size, :])
                 h1, w1, _ = weight_cur.shape
                 gk_tmp = cv2.resize(gk, (w1, h1))
@@ -242,7 +290,7 @@ def merge(
                 weight_tmp = 1 - weight_tmp
                 rtn[x * size // 2: x * size // 2 + size, y * size // 2: y * size // 2 + size, :] = weight_cur * rtn[x * size // 2: x * size // 2 + size, y * size // 2: y * size // 2 + size, :] + weight_tmp * img_tmp
                 idx += 1
-            img_tmp = cv2.imread(path_d + file[:-4] + '_%03d.png' % idx)
+            img_tmp = cv2.imread(str(path_d/f"{img_path.stem}_{idx:03d}.png"))
             weight_cur = copy.deepcopy(rtn[x * size // 2: x * size // 2 + size, -size:, :])
             h1, w1, _ = weight_cur.shape
             gk_tmp = cv2.resize(gk, (w1, h1))
@@ -255,7 +303,7 @@ def merge(
         for y in range(Y - 1):
             if y * size // 2 + size > W:
                 break
-            img_tmp = cv2.imread(path_d + file[:-4] + '_%03d.png' % idx)
+            img_tmp = cv2.imread(str(path_d/f"{img_path.stem}_{idx:03d}.png"))
             weight_cur = copy.deepcopy(rtn[-size:, y * size // 2: y * size // 2 + size, :])
             h1, w1, _ = weight_cur.shape
             gk_tmp = cv2.resize(gk, (w1, h1))
@@ -265,7 +313,7 @@ def merge(
             weight_tmp = 1 - weight_tmp
             rtn[-size:, y * size // 2: y * size // 2 + size, :] = weight_cur * rtn[-size:, y * size // 2: y * size // 2 + size, :] + weight_tmp * img_tmp
             idx += 1
-        img_tmp = cv2.imread(path_d + file[:-4] + '_%03d.png' % idx)
+        img_tmp = cv2.imread(str(path_d/f"{img_path.stem}_{idx:03d}.png"))
         weight_cur = copy.deepcopy(rtn[-size:, -size:, :])
         h1, w1, _ = weight_cur.shape
         gk_tmp = cv2.resize(gk, (w1, h1))
@@ -277,8 +325,9 @@ def merge(
         idx += 1
         # rtn[rtn < 127] = 0
         # rtn[rtn >= 127] = 255
-        cv2.imwrite(path_r + file[:-4] + '.png', np.uint8(rtn))
-    return path_r
+        cv2.imwrite(str(output_dir/f"{img_path.stem}.png"), np.uint8(rtn))
+
+    return str(output_dir)+"/"
 
 
 def gkern(kernlen=7, nsig=3):
@@ -316,6 +365,12 @@ def metric(premask, groundtruth):
     if np.sum(cross) + np.sum(union) == 0:
         iou = 1
     return f1, iou
+
+
+def split_in_chunks(lst: list[Any], n: int) -> Generator[list, None, None]:
+    """Yield successive n-sized chunks from a list."""
+    for i in range(0, len(lst), n):
+        yield lst[i:i + n]
 
 
 if __name__ == '__main__':
