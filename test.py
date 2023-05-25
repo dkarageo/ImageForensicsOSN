@@ -130,6 +130,8 @@ def process_images_in_dir(
     chunk_size: Optional[int] = None
 ) -> None:
     images: list[pathlib.Path] = sorted(list(input_dir.iterdir()))
+    images = find_images_without_cached_output(images, output_dir)
+
     if chunk_size is None:
         images_batches: list[list[pathlib.Path]] = [images]
     else:
@@ -137,6 +139,26 @@ def process_images_in_dir(
 
     for batch in images_batches:
         forensics_test(model, batch, output_dir, temp_dir, device)
+
+
+def find_images_without_cached_output(
+    images: list[pathlib.Path],
+    cache_dir: pathlib.Path
+) -> list[pathlib.Path]:
+    uncached: list[pathlib.Path] = []
+
+    print(f"Searching cached images in {cache_dir}")
+
+    for img in tqdm(images, desc="Searching cache", unit="image"):
+        target_image: pathlib.Path = cache_dir / f"{img.stem}.png"  # Path of expected outputs.
+        if not target_image.exists():
+            uncached.append(img)
+
+    found: int = len(images) - len(uncached)
+    if found > 0:
+        print(f"Found {found} images from a previous run.")
+
+    return uncached
 
 
 def forensics_test(
