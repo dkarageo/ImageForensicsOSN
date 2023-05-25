@@ -1,3 +1,4 @@
+import logging
 import os
 import copy
 import pathlib
@@ -291,63 +292,67 @@ def merge(
     gk = 1 - gk
 
     for img_path in tqdm(sorted(images), desc="Merging output images", unit="image"):
-        img = cv2.imread(str(img_path))
-        H, W, _ = img.shape
-        X, Y = H // (size // 2) + 1, W // (size // 2) + 1
-        idx = 0
-        rtn = np.ones((H, W, 3), dtype=np.float32) * -1
-        for x in range(X-1):
-            if x * size // 2 + size > H:
-                break
-            for y in range(Y-1):
-                if y * size // 2 + size > W:
+        try:
+            img = cv2.imread(str(img_path))
+            H, W, _ = img.shape
+            X, Y = H // (size // 2) + 1, W // (size // 2) + 1
+            idx = 0
+            rtn = np.ones((H, W, 3), dtype=np.float32) * -1
+            for x in range(X-1):
+                if x * size // 2 + size > H:
                     break
+                for y in range(Y-1):
+                    if y * size // 2 + size > W:
+                        break
+                    img_tmp = cv2.imread(str(path_d/f"{img_path.stem}_{idx:03d}.png"))
+                    weight_cur = copy.deepcopy(rtn[x * size // 2: x * size // 2 + size, y * size // 2: y * size // 2 + size, :])
+                    h1, w1, _ = weight_cur.shape
+                    gk_tmp = cv2.resize(gk, (w1, h1))
+                    weight_cur[weight_cur != -1] = gk_tmp[weight_cur != -1]
+                    weight_cur[weight_cur == -1] = 0
+                    weight_tmp = copy.deepcopy(weight_cur)
+                    weight_tmp = 1 - weight_tmp
+                    rtn[x * size // 2: x * size // 2 + size, y * size // 2: y * size // 2 + size, :] = weight_cur * rtn[x * size // 2: x * size // 2 + size, y * size // 2: y * size // 2 + size, :] + weight_tmp * img_tmp
+                    idx += 1
                 img_tmp = cv2.imread(str(path_d/f"{img_path.stem}_{idx:03d}.png"))
-                weight_cur = copy.deepcopy(rtn[x * size // 2: x * size // 2 + size, y * size // 2: y * size // 2 + size, :])
+                weight_cur = copy.deepcopy(rtn[x * size // 2: x * size // 2 + size, -size:, :])
                 h1, w1, _ = weight_cur.shape
                 gk_tmp = cv2.resize(gk, (w1, h1))
                 weight_cur[weight_cur != -1] = gk_tmp[weight_cur != -1]
                 weight_cur[weight_cur == -1] = 0
                 weight_tmp = copy.deepcopy(weight_cur)
                 weight_tmp = 1 - weight_tmp
-                rtn[x * size // 2: x * size // 2 + size, y * size // 2: y * size // 2 + size, :] = weight_cur * rtn[x * size // 2: x * size // 2 + size, y * size // 2: y * size // 2 + size, :] + weight_tmp * img_tmp
+                rtn[x * size // 2: x * size // 2 + size, -size:, :] = weight_cur * rtn[x * size // 2: x * size // 2 + size, -size:, :] + weight_tmp * img_tmp
+                idx += 1
+            for y in range(Y - 1):
+                if y * size // 2 + size > W:
+                    break
+                img_tmp = cv2.imread(str(path_d/f"{img_path.stem}_{idx:03d}.png"))
+                weight_cur = copy.deepcopy(rtn[-size:, y * size // 2: y * size // 2 + size, :])
+                h1, w1, _ = weight_cur.shape
+                gk_tmp = cv2.resize(gk, (w1, h1))
+                weight_cur[weight_cur != -1] = gk_tmp[weight_cur != -1]
+                weight_cur[weight_cur == -1] = 0
+                weight_tmp = copy.deepcopy(weight_cur)
+                weight_tmp = 1 - weight_tmp
+                rtn[-size:, y * size // 2: y * size // 2 + size, :] = weight_cur * rtn[-size:, y * size // 2: y * size // 2 + size, :] + weight_tmp * img_tmp
                 idx += 1
             img_tmp = cv2.imread(str(path_d/f"{img_path.stem}_{idx:03d}.png"))
-            weight_cur = copy.deepcopy(rtn[x * size // 2: x * size // 2 + size, -size:, :])
+            weight_cur = copy.deepcopy(rtn[-size:, -size:, :])
             h1, w1, _ = weight_cur.shape
             gk_tmp = cv2.resize(gk, (w1, h1))
             weight_cur[weight_cur != -1] = gk_tmp[weight_cur != -1]
             weight_cur[weight_cur == -1] = 0
             weight_tmp = copy.deepcopy(weight_cur)
             weight_tmp = 1 - weight_tmp
-            rtn[x * size // 2: x * size // 2 + size, -size:, :] = weight_cur * rtn[x * size // 2: x * size // 2 + size, -size:, :] + weight_tmp * img_tmp
+            rtn[-size:, -size:, :] = weight_cur * rtn[-size:, -size:, :] + weight_tmp * img_tmp
             idx += 1
-        for y in range(Y - 1):
-            if y * size // 2 + size > W:
-                break
-            img_tmp = cv2.imread(str(path_d/f"{img_path.stem}_{idx:03d}.png"))
-            weight_cur = copy.deepcopy(rtn[-size:, y * size // 2: y * size // 2 + size, :])
-            h1, w1, _ = weight_cur.shape
-            gk_tmp = cv2.resize(gk, (w1, h1))
-            weight_cur[weight_cur != -1] = gk_tmp[weight_cur != -1]
-            weight_cur[weight_cur == -1] = 0
-            weight_tmp = copy.deepcopy(weight_cur)
-            weight_tmp = 1 - weight_tmp
-            rtn[-size:, y * size // 2: y * size // 2 + size, :] = weight_cur * rtn[-size:, y * size // 2: y * size // 2 + size, :] + weight_tmp * img_tmp
-            idx += 1
-        img_tmp = cv2.imread(str(path_d/f"{img_path.stem}_{idx:03d}.png"))
-        weight_cur = copy.deepcopy(rtn[-size:, -size:, :])
-        h1, w1, _ = weight_cur.shape
-        gk_tmp = cv2.resize(gk, (w1, h1))
-        weight_cur[weight_cur != -1] = gk_tmp[weight_cur != -1]
-        weight_cur[weight_cur == -1] = 0
-        weight_tmp = copy.deepcopy(weight_cur)
-        weight_tmp = 1 - weight_tmp
-        rtn[-size:, -size:, :] = weight_cur * rtn[-size:, -size:, :] + weight_tmp * img_tmp
-        idx += 1
-        # rtn[rtn < 127] = 0
-        # rtn[rtn >= 127] = 255
-        cv2.imwrite(str(output_dir/f"{img_path.stem}.png"), np.uint8(rtn))
+            # rtn[rtn < 127] = 0
+            # rtn[rtn >= 127] = 255
+            cv2.imwrite(str(output_dir/f"{img_path.stem}.png"), np.uint8(rtn))
+        except Exception as e:
+            logging.error(f"Failed to merge the outputs of {img_path}")
+            logging.exception(e)
 
     return str(output_dir)+"/"
 
