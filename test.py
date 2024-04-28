@@ -3,6 +3,7 @@ import os
 import copy
 import pathlib
 import shutil
+import timeit
 from typing import Any, Generator, Optional
 
 import numpy as np
@@ -138,8 +139,17 @@ def process_images_in_dir(
     else:
         images_batches: list[list[pathlib.Path]] = list(split_in_chunks(images, chunk_size))
 
+    torch.cuda.synchronize()
+    start_time: float = timeit.default_timer()
+
     for batch in images_batches:
         forensics_test(model, batch, output_dir, temp_dir, device)
+
+    torch.cuda.synchronize()
+    stop_time: float = timeit.default_timer()
+    elapsed_time: float = stop_time - start_time
+    print(f"Total time: {elapsed_time} secs")
+    print(f"Time per image: {elapsed_time / len(images)}")
 
 
 def find_images_without_cached_output(
