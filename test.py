@@ -17,6 +17,7 @@ from sklearn.metrics import roc_auc_score
 from tqdm import tqdm
 
 from models.scse import SCSEUnet
+import csv_utils
 
 
 class MyDataset(Dataset):
@@ -81,7 +82,7 @@ class Model(nn.Module):
 
 @click.command(help="Performs a forensics analysis of images using IFOSN.")
 @click.option("--input_dir",
-              type=click.Path(file_okay=False, path_type=pathlib.Path),
+              type=click.Path(exists=True, path_type=pathlib.Path),
               default=pathlib.Path("./data/input"),
               help="Directory that contains the images to be analyzed.")
 @click.option("--output_dir",
@@ -98,12 +99,22 @@ class Model(nn.Module):
                    "The use of this parameter allows to reduce the amount of disk required for "
                    "storing the intermediate files that are generated during the "
                    "IFOSN computation.")
+@click.option("--csv_root_dir", "-r",
+              type=click.Path(exists=True, file_okay=False, path_type=pathlib.Path),
+              help="Directory to which paths into the provided input CSV file are relative to. "
+                   "This option is only meaningful when the `input_dir` option points to a CSV "
+                   "file.")
+@click.option("--update_input_csv", is_flag=True, default=False,
+              help="When a CSV file is provided as input, providing this flag enables you to "
+                   "update the input CSV, instead of exporting a new one.")
 def cli(
     input_dir: pathlib.Path,
     output_dir: pathlib.Path,
     temp_dir: pathlib.Path,
     device: str,
-    chunk_size: Optional[int]
+    chunk_size: Optional[int],
+    csv_root_dir: Optional[pathlib.Path],
+    update_input_csv: bool
 ) -> None:
     # Load model.
     model = Model(device=device)
@@ -113,25 +124,37 @@ def cli(
 
     temp_dir.mkdir(exist_ok=True, parents=True)
 
-    process_images_in_dir(
+    process_images(
         model=model,
-        input_dir=input_dir,
+        input_source=input_dir,
         output_dir=output_dir,
         temp_dir=temp_dir,
         device=device,
-        chunk_size=chunk_size
+        chunk_size=chunk_size,
+        csv_root_dir=csv_root_dir,
+        update_input_csv=update_input_csv
     )
 
 
-def process_images_in_dir(
+def process_images(
     model,
-    input_dir: pathlib.Path,
+    input_source: pathlib.Path,
     output_dir: pathlib.Path,
     temp_dir: pathlib.Path,
     device: str,
-    chunk_size: Optional[int] = None
+    chunk_size: Optional[int] = None,
+    csv_root_dir: Optional[pathlib.Path] = None,
+    update_input_csv: bool = False
 ) -> None:
-    images: list[pathlib.Path] = sorted(list(input_dir.iterdir()))
+    if input_source.is_dir():
+        images: list[pathlib.Path] = sorted(list(input_source.iterdir()))
+    else:
+        forged_images: list[pathlib.Path]
+        authentic_images: list[pathlib.Path]
+        forged_images, authentic_images, _ = csv_utils.load_dataset_from_csv(
+            input_source, csv_root_dir
+        )
+        images: list[pathlib.Path] = sorted(forged_images + authentic_images)
     images = find_images_without_cached_output(images, output_dir)
 
     if chunk_size is None:
@@ -142,14 +165,27 @@ def process_images_in_dir(
     torch.cuda.synchronize()
     start_time: float = timeit.default_timer()
 
+    localization_masks: dict[pathlib.Path, pathlib.Path] = {}
     for batch in images_batches:
-        forensics_test(model, batch, output_dir, temp_dir, device)
+        batch_localization_masks: dict[pathlib.Path, pathlib.Path] = forensics_test(
+            model, batch, output_dir, temp_dir, device, output_relative_to=csv_root_dir
+        )
+        localization_masks.update(batch_localization_masks)
 
     torch.cuda.synchronize()
     stop_time: float = timeit.default_timer()
     elapsed_time: float = stop_time - start_time
     print(f"Total time: {elapsed_time} secs")
     print(f"Time per image: {elapsed_time / len(images)}")
+
+    # In case of a CSV source of images, update it if requested.
+    if input_source.is_file() and update_input_csv:
+        out_data: csv_utils.AlgorithmOutputData = csv_utils.AlgorithmOutputData(
+            tampered=localization_masks,
+            untampered=None,
+            response_times=None
+        )
+        out_data.save_csv(input_source, csv_root_dir, "ifosn")
 
 
 def find_images_without_cached_output(
@@ -177,77 +213,119 @@ def forensics_test(
     images: list[pathlib.Path],
     output_dir: pathlib.Path,
     temp_dir: pathlib.Path,
-    device: str
-):
+    device: str,
+    output_relative_to: Optional[pathlib.Path] = None
+) -> dict[pathlib.Path, pathlib.Path]:
+    """Analyzes a set of images using an IFOSN model.
+
+    :param model: The IFOSN model.
+    :param images: The images to analyze.
+    :param output_dir: The output directory.
+    :param temp_dir: The temporary directory.
+    :param device: The device to use.
+    :param output_relative_to: A path that belongs to the path tree of all the input images.
+        When this path is provided, in the output directory the whole path structure
+        below this path, will be maintained. It is useful when the input images are not
+        included under a single directory, thus several ones may share the same filename.
+        So, retaining the path structure of the input image is required in order to not
+        overwrite the result of an image, with the result of another.
+
+    :returns: A dict of paths to the forgery localization masks corresponding to the
+        input images.
+    """
+
     test_size: int = 896
 
-    # Decompose input images.
-    decomposition_dir: pathlib.Path = temp_dir / f"input_decompose_{test_size}"
-    decompose(images, test_size, decomposition_dir)
+    # Decompose the input images.
+    decomposition_base_dir: pathlib.Path = temp_dir / f"input_decompose_{test_size}"
+    decomposition_dirs: set[pathlib.Path] = decompose(
+        images, test_size, decomposition_base_dir, output_relative_to
+    )
 
-    # Compute forgery localization masks of the decomposed images.
-    test_dataset = MyDataset(test_path=str(decomposition_dir)+"/",
-                             size=int(test_size))
-    predictions_dir: pathlib.Path = temp_dir / f"input_decompose_{test_size}_pred"
-    test_loader = DataLoader(dataset=test_dataset, batch_size=1, shuffle=False, num_workers=1)
-    predictions_dir.mkdir(parents=True, exist_ok=True)
-    for items in tqdm(test_loader, desc="Computing IFOSN model outputs", unit="image"):
-        Ii, Mg = (item.to(device) for item in items[:-1])
-        filename = items[-1]
-        Mo = model(Ii)
-        Mo = Mo * 255.
-        Mo = Mo.permute(0, 2, 3, 1).cpu().detach().numpy()
-        for i in range(len(Mo)):
-            Mo_tmp = Mo[i][..., ::-1]
-            cv2.imwrite(str(predictions_dir/f"{filename[i][:-4]}.png"), Mo_tmp)
+    # Compute the forgery localization masks of the decomposed images.
+    predictions_base_dir: pathlib.Path = temp_dir / f"input_decompose_{test_size}_pred"
+    predictions_dirs: set[pathlib.Path] = set()
+    for decomp_dir in decomposition_dirs:
+        test_dataset = MyDataset(test_path=str(decomp_dir)+"/",
+                                 size=int(test_size))
+        if output_relative_to is None:
+            pred_dir: pathlib.Path = predictions_base_dir
+        else:
+            pred_dir: pathlib.Path = (
+                predictions_base_dir / decomp_dir.relative_to(decomposition_base_dir)
+            )
+        predictions_dirs.add(pred_dir)
+        test_loader = DataLoader(dataset=test_dataset, batch_size=1, shuffle=False, num_workers=1)
+        pred_dir.mkdir(parents=True, exist_ok=True)
+        for items in tqdm(test_loader, desc="Computing IFOSN model outputs", unit="image"):
+            Ii, Mg = (item.to(device) for item in items[:-1])
+            filename = items[-1]
+            Mo = model(Ii)
+            Mo = Mo * 255.
+            Mo = Mo.permute(0, 2, 3, 1).cpu().detach().numpy()
+            for i in range(len(Mo)):
+                Mo_tmp = Mo[i][..., ::-1]
+                cv2.imwrite(str(pred_dir/f"{filename[i][:-4]}.png"), Mo_tmp)
 
     # Clean-up decomposition directory.
-    if decomposition_dir.exists():
-        shutil.rmtree(decomposition_dir)
+    if decomposition_base_dir.exists():
+        shutil.rmtree(decomposition_base_dir)
 
     # Merge predictions of the decomposed images into the final predictions for each input image.
-    path_pre = merge(images, test_size, output_dir, temp_dir)
+    forgery_localization_masks: dict[pathlib.Path, pathlib.Path] = merge(
+        images, test_size, output_dir, temp_dir, output_relative_to=output_relative_to
+    )
 
     # Clean-up predictions directory of the decomposed images.
-    if predictions_dir.exists():
-        shutil.rmtree(predictions_dir)
+    if predictions_base_dir.exists():
+        shutil.rmtree(predictions_base_dir)
 
-    # Perform evaluation.
-    path_gt = 'data/mask/'
-    if os.path.exists(path_gt):
-        flist = sorted(os.listdir(path_pre))
-        auc, f1, iou = [], [], []
-        for file in flist:
-            pre = cv2.imread(path_pre + file)
-            gt = cv2.imread(path_gt + file[:-4] + '.png')
-            H, W, C = pre.shape
-            Hg, Wg, C = gt.shape
-            if H != Hg or W != Wg:
-                gt = cv2.resize(gt, (W, H))
-                gt[gt > 127] = 255
-                gt[gt <= 127] = 0
-            if np.max(gt) != np.min(gt):
-                auc.append(roc_auc_score(
-                    (gt.reshape(H * W * C) / 255).astype('int'), pre.reshape(H * W * C) / 255.)
-                )
-            pre[pre > 127] = 255
-            pre[pre <= 127] = 0
-            a, b = metric(pre / 255, gt / 255)
-            f1.append(a)
-            iou.append(b)
-        print('Evaluation: AUC: %5.4f, F1: %5.4f, IOU: %5.4f' % (np.mean(auc), np.mean(f1),
-                                                                 np.mean(iou)))
-    return 0
+    # # Perform evaluation.
+    # path_gt = 'data/mask/'
+    # if os.path.exists(path_gt):
+    #     flist = sorted(os.listdir(path_pre))
+    #     auc, f1, iou = [], [], []
+    #     for file in flist:
+    #         pre = cv2.imread(path_pre + file)
+    #         gt = cv2.imread(path_gt + file[:-4] + '.png')
+    #         H, W, C = pre.shape
+    #         Hg, Wg, C = gt.shape
+    #         if H != Hg or W != Wg:
+    #             gt = cv2.resize(gt, (W, H))
+    #             gt[gt > 127] = 255
+    #             gt[gt <= 127] = 0
+    #         if np.max(gt) != np.min(gt):
+    #             auc.append(roc_auc_score(
+    #                 (gt.reshape(H * W * C) / 255).astype('int'), pre.reshape(H * W * C) / 255.)
+    #             )
+    #         pre[pre > 127] = 255
+    #         pre[pre <= 127] = 0
+    #         a, b = metric(pre / 255, gt / 255)
+    #         f1.append(a)
+    #         iou.append(b)
+    #     print('Evaluation: AUC: %5.4f, F1: %5.4f, IOU: %5.4f' % (np.mean(auc), np.mean(f1),
+    #                                                              np.mean(iou)))
+    return forgery_localization_masks
 
 
 def decompose(
     images: list[pathlib.Path],
     size: int,
-    out_path: pathlib.Path
-) -> None:
-    out_path.mkdir(exist_ok=True, parents=True)
+    out_path: pathlib.Path,
+    output_relative_to: Optional[pathlib.Path] = None
+) -> set[pathlib.Path]:
+    decomposition_dirs: set[pathlib.Path] = set()
 
     for img_path in tqdm(images, desc="Decomposing input images", unit="image"):
+        if output_relative_to is None:
+            image_decomposition_dir: pathlib.Path = out_path
+        else:
+            image_decomposition_dir: pathlib.Path = (
+                out_path / img_path.parent.relative_to(output_relative_to)
+            )
+        image_decomposition_dir.mkdir(exist_ok=True, parents=True)
+        decomposition_dirs.add(image_decomposition_dir)
+
         # Load image.
         img: np.ndarray = cv2.imread(str(img_path))
         H, W, _ = img.shape
@@ -261,14 +339,18 @@ def decompose(
             for y in range(Y-1):
                 if y * size // 2 + size > W:
                     break
-                decomposition_out_path: pathlib.Path = out_path / f"{img_path.stem}_{idx:03d}.png"
+                decomposition_out_path: pathlib.Path = (
+                    image_decomposition_dir / f"{img_path.stem}_{idx:03d}.png"
+                )
                 if not decomposition_out_path.exists():
                     img_tmp = img[x * size // 2: x * size // 2 + size,
                                   y * size // 2: y * size // 2 + size,
                                   :]
                     cv2.imwrite(str(decomposition_out_path), img_tmp)
                 idx += 1
-            decomposition_out_path: pathlib.Path = out_path / f"{img_path.stem}_{idx:03d}.png"
+            decomposition_out_path: pathlib.Path = (
+                image_decomposition_dir / f"{img_path.stem}_{idx:03d}.png"
+            )
             if not decomposition_out_path.exists():
                 img_tmp = img[x * size // 2: x * size // 2 + size, -size:, :]
                 cv2.imwrite(str(decomposition_out_path), img_tmp)
@@ -276,32 +358,51 @@ def decompose(
         for y in range(Y - 1):
             if y * size // 2 + size > W:
                 break
-            decomposition_out_path: pathlib.Path = out_path / f"{img_path.stem}_{idx:03d}.png"
+            decomposition_out_path: pathlib.Path = (
+                image_decomposition_dir / f"{img_path.stem}_{idx:03d}.png"
+            )
             if not decomposition_out_path.exists():
                 img_tmp = img[-size:, y * size // 2: y * size // 2 + size, :]
                 cv2.imwrite(str(decomposition_out_path), img_tmp)
             idx += 1
-        decomposition_out_path: pathlib.Path = out_path / f"{img_path.stem}_{idx:03d}.png"
+        decomposition_out_path: pathlib.Path = (
+            image_decomposition_dir / f"{img_path.stem}_{idx:03d}.png"
+        )
         if not decomposition_out_path.exists():
             img_tmp = img[-size:, -size:, :]
             cv2.imwrite(str(decomposition_out_path), img_tmp)
         idx += 1
 
+    return decomposition_dirs
+
 
 def merge(
     images: list[pathlib.Path],
-    test_size: str,
+    size: int,
     output_dir: pathlib.Path,
-    temp_dir: pathlib.Path
-) -> str:
-    output_dir.mkdir(exist_ok=True, parents=True)
-    path_d: pathlib.Path = temp_dir / f'input_decompose_{test_size}_pred'
-    size = int(test_size)
+    temp_dir: pathlib.Path,
+    output_relative_to: Optional[pathlib.Path] = None
+) -> dict[pathlib.Path, pathlib.Path]:
+    forgery_localization_masks: dict[pathlib.Path, pathlib.Path] = {}
 
     gk = gkern(size)
     gk = 1 - gk
 
     for img_path in tqdm(sorted(images), desc="Merging output images", unit="image"):
+        if output_relative_to is None:
+            image_output_dir: pathlib.Path = output_dir
+            path_d: pathlib.Path = temp_dir / f'input_decompose_{size}_pred'
+        else:
+            image_output_dir: pathlib.Path = (
+                output_dir / img_path.parent.relative_to(output_relative_to)
+            )
+            path_d: pathlib.Path = (
+                temp_dir
+                / f'input_decompose_{size}_pred'
+                / img_path.parent.relative_to(output_relative_to)
+            )
+        image_output_dir.mkdir(exist_ok=True, parents=True)
+
         try:
             img = cv2.imread(str(img_path))
             H, W, _ = img.shape
@@ -359,12 +460,14 @@ def merge(
             idx += 1
             # rtn[rtn < 127] = 0
             # rtn[rtn >= 127] = 255
-            cv2.imwrite(str(output_dir/f"{img_path.stem}.png"), np.uint8(rtn))
+            loc_mask_path: pathlib.Path = image_output_dir / f"{img_path.stem}.png"
+            cv2.imwrite(str(loc_mask_path), np.uint8(rtn))
+            forgery_localization_masks[img_path] = loc_mask_path
         except Exception as e:
             logging.error(f"Failed to merge the outputs of {img_path}")
             logging.exception(e)
 
-    return str(output_dir)+"/"
+    return forgery_localization_masks
 
 
 def gkern(kernlen=7, nsig=3):
